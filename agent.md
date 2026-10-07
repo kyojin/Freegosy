@@ -21,6 +21,9 @@ Freegosy is a cross-platform Flutter app for browsing a RomM library, downloadin
 
 ## File Map
 
+### Build
+- `.github/workflows/windows-test-build.yml` — Public-fork Windows x64 test build on the dedicated CI branch; analyzes, tests and uploads a one-day portable artifact without publishing a release.
+
 ### Entry Points
 - `lib/main.dart` — App entry point. Initializes Riverpod ProviderScope. Calls app.dart.
 - `lib/app.dart` — MaterialApp setup, theme, initial route, navigation shell.

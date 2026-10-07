@@ -1,0 +1,69 @@
+name: Windows x64 test build
+
+on:
+  push:
+    branches: [ci/windows-test-build]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.6'
+          channel: stable
+          architecture: x64
+          cache: true
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Analyze
+        run: flutter analyze --no-pub
+      - name: Test save-slot and backup sync
+        run: >-
+          flutter test --no-pub
+          test/unit/game_launch_service_state_sync_test.dart
+          test/unit/game_launch_service_backup_sync_test.dart
+          test/unit/save_operation_lock_test.dart
+          test/unit/save_push_result_test.dart
+          test/core/save/background_sync_queue_race_test.dart
+          test/unit/romm_save_slot_test.dart
+          test/widgets/settings_screen_test.dart
+          test/unit/backup_service_emulator_id_test.dart
+          --reporter expanded
+      - name: Test existing save and emulator regressions
+        run: >-
+          flutter test --no-pub
+          test/unit/save_sync_service_test.dart
+          test/unit/save_sync_regression_test.dart
+          test/unit/save_strategy_platform_zip_test.dart
+          test/unit/pcsx2_file_cards_test.dart
+          test/unit/pcsx2_save_strategy_test.dart
+          test/unit/game_launch_service_activity_test.dart
+          test/unit/game_launch_service_state_load_test.dart
+          test/core/save/backup_sync_test.dart
+          --reporter expanded
+      - name: Build Windows x64 release
+        run: flutter build windows --release --no-pub
+      - name: Verify x64 executable
+        shell: pwsh
+        run: |
+          $exe = 'build/windows/x64/runner/Release/freegosy.exe'
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) { throw 'Expected a Windows x64 executable.' }
+          $release = 'build/windows/x64/runner/Release'
+          $size = (Get-ChildItem $release -Recurse -File | Measure-Object Length -Sum).Sum
+          if ($size -gt 200MB) { throw 'Bundle exceeds the 200 MB test-artifact limit.' }
+      - name: Upload portable Windows x64 build
+        uses: actions/upload-artifact@v4
+        with:
+          name: freegosy-windows-x64-save-slot-backup-fix
+          path: build/windows/x64/runner/Release/
+          if-no-files-found: error
+          retention-days: 1
