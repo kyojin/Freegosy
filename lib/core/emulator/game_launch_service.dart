@@ -12,6 +12,7 @@ import '../storage/directory_service.dart';
 import '../save/backup_entry.dart';
 import '../save/backup_repository.dart';
 import '../save/backup_service.dart';
+import '../save/save_operation_lock.dart';
 import '../save/save_sync_service.dart';
 import '../save/save_strategy.dart';
 import '../save/state_sync_service.dart';
@@ -336,35 +337,62 @@ class GameLaunchService {
 
     var syncOk = false;
     String? saveSyncBlocked;
-    try {
-      syncOk = await saveSyncService.pushSaves(
-        game,
-        romPath,
-        sessionStart: session.sessionStart,
-        syncMode: syncMode,
-        coreOverride: overrideCoreId,
-        emulatorId: session.emulatorId,
-      );
-    } on SaveSyncNotPossibleException catch (e) {
-      saveSyncBlocked = e.message;
-    }
-
-    // Save states sync separately from game saves; see [pushStatesAfterExit].
-    final stateConflictCount = await pushStatesAfterExit(session, game, romPath);
-
+    var stateConflictCount = 0;
     String? backupZipPath;
-    try {
-      final postBackup = await backupService.createImmediate(game, romPath, saveSyncService, emulatorId: session.emulatorId);
-      if (postBackup != null) {
-        await backupRepository.addEntry(
-          game.id,
-          BackupEntry(timestamp: DateTime.now(), md5Hash: postBackup.md5, localZipPath: postBackup.zipPath),
+    await SaveOperationLock.run(game.id, (lease) async {
+      final cutoff = DateTime.now();
+      final pendingAtStart = backupRepository
+          .getEntries(game.id)
+          .where((entry) => !entry.isSynced && !entry.timestamp.isAfter(cutoff))
+          .toList();
+      var retryNeeded = false;
+      try {
+        final pushResult = await saveSyncService.pushSavesWithResult(
+          game,
+          romPath,
+          sessionStart: session.sessionStart,
+          syncMode: syncMode,
+          coreOverride: overrideCoreId,
+          emulatorId: session.emulatorId,
+          lease: lease,
         );
-        backupZipPath = postBackup.zipPath;
+        syncOk = pushResult == SavePushResult.synced;
+        retryNeeded = pushResult == SavePushResult.failed;
+        if (syncOk)
+          await backupRepository.acknowledgeEntries(game.id, pendingAtStart);
+      } on SaveSyncNotPossibleException catch (e) {
+        saveSyncBlocked = e.message;
       }
-    } catch (e) {
-      dev.log('Post-exit backup failed', error: e);
-    }
+
+      // Save states sync separately from game saves; see [pushStatesAfterExit].
+      stateConflictCount = await pushStatesAfterExit(session, game, romPath);
+
+      try {
+        final postBackup = await backupService.createImmediate(
+          game,
+          romPath,
+          saveSyncService,
+          emulatorId: session.emulatorId,
+        );
+        if (postBackup != null) {
+          await backupRepository.addEntry(
+            game.id,
+            BackupEntry(
+              timestamp: DateTime.now(),
+              md5Hash: postBackup.md5,
+              localZipPath: postBackup.zipPath,
+              // Only a failed upload belongs in the retry queue. Skipped and
+              // blocked saves keep a local restore point without bypassing
+              // the normal sync policy on startup.
+              isSynced: !retryNeeded,
+            ),
+          );
+          backupZipPath = postBackup.zipPath;
+        }
+      } catch (e) {
+        dev.log('Post-exit backup failed', error: e);
+      }
+    });
 
     var playSessionRecorded = false;
     try {

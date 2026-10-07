@@ -10,6 +10,7 @@ import '../romm/romm_models.dart';
 import '../romm/romm_service.dart';
 import '../storage/directory_service.dart';
 import 'save_strategy.dart';
+import 'save_operation_lock.dart';
 import 'strategies/retroarch_save_strategy.dart';
 import 'strategies/dolphin_save_strategy.dart';
 import 'strategies/eden_save_strategy.dart';
@@ -29,6 +30,10 @@ import 'strategies/cemu_save_strategy.dart';
 import 'strategies/azahar_save_strategy.dart';
 import '../emulator/strategy_registry.dart';
 import '../platform/platform_info.dart';
+
+/// A skipped push (no changes, no files, or an invalid payload) is not an
+/// upload failure and must not be retried as an unfiltered local backup.
+enum SavePushResult { synced, skipped, failed }
 
 class SaveConflictException implements Exception {
   final Game game;
@@ -296,6 +301,16 @@ class SaveSyncService {
     debugPrint('[SaveSync] Cleared hash cache for game $gameId');
   }
 
+  Future<void> _discardBundle(io.File file, bool isBundle) async {
+    if (!isBundle) return;
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (e) {
+      // Cleanup cannot change whether RomM accepted or rejected the save.
+      debugPrint('[SaveSync] Could not remove temporary bundle: $e');
+    }
+  }
+
   Future<String> _hashFile(io.File file) async {
     final bytes = await file.readAsBytes();
     return md5.convert(bytes).toString();
@@ -490,23 +505,9 @@ class SaveSyncService {
   // Shared across service instances: settings changes can recreate providers
   // while an old instance is still uploading. Serialize each game's syncs so
   // a delayed push cannot mark a newer restore as belonging to its old slot.
-  static final Map<String, Future<void>> _pendingGameSyncs = {};
-
-  static Future<T> _runGameSync<T>(String gameId, Future<T> Function() body) async {
-    final previous = _pendingGameSyncs[gameId] ?? Future<void>.value();
-    final finished = Completer<void>();
-    final tail = finished.future;
-    _pendingGameSyncs[gameId] = tail;
-    await previous;
-    try {
-      return await body();
-    } finally {
-      finished.complete();
-      if (identical(_pendingGameSyncs[gameId], tail)) {
-        _pendingGameSyncs.remove(gameId);
-      }
-    }
-  }
+  static Future<T> _runGameSync<T>(String gameId, Future<T> Function() body,
+      {SaveOperationLease? lease}) =>
+      SaveOperationLock.run(gameId, (_) => body(), lease: lease);
 
   // ---------------------------------------------------------------------------
   // Public entry points — version-aware routing
@@ -523,6 +524,15 @@ class SaveSyncService {
   /// (issue #79).
   Future<bool> pushSaves(Game game, String romPath,
       {DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
+    final result = await pushSavesWithResult(game, romPath,
+        sessionStart: sessionStart, syncMode: syncMode, force: force,
+        coreOverride: coreOverride, emulatorId: emulatorId);
+    return result == SavePushResult.synced;
+  }
+
+  /// Reports whether a push succeeded, was skipped, or needs a retry.
+  Future<SavePushResult> pushSavesWithResult(Game game, String romPath,
+      {DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId, SaveOperationLease? lease}) async {
     final slot = saveSlot;
     debugPrint('[SaveSync] ─── PUSH START ─── game="${game.displayName}" slug=${game.platformSlug}');
     debugPrint('[SaveSync]   romPath: $romPath');
@@ -538,7 +548,7 @@ class SaveSyncService {
       }
       return _legacyPushSaves(game, romPath,
           slot: slot, sessionStart: sessionStart, syncMode: syncMode, force: force, coreOverride: coreOverride, emulatorId: emulatorId);
-    });
+    }, lease: lease);
   }
 
   /// In-memory cache of the last pull-check timestamp and slot per game.
@@ -672,13 +682,13 @@ class SaveSyncService {
   // RomM 4.9+ device-based sync
   // ---------------------------------------------------------------------------
 
-  Future<bool> _devicePushSaves(Game game, String romPath,
+  Future<SavePushResult> _devicePushSaves(Game game, String romPath,
       {required String slot, DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
     try {
       final strategy = getStrategyForGame(game, emulatorId: emulatorId);
       if (strategy == null) {
         debugPrint('[SaveSync] [push] No save strategy for slug="${game.platformSlug}" — game "${game.displayName}" not supported');
-        return false;
+        return SavePushResult.skipped;
       }
       debugPrint('[SaveSync] [push] Strategy: ${strategy.strategyId}  game="${game.displayName}"');
       _applyStrategyMappings(strategy, game, coreOverride: coreOverride);
@@ -692,7 +702,7 @@ class SaveSyncService {
       debugPrint('[SaveSync] [push] Found ${filesMap.length} save file(s) from strategy');
       if (filesMap.isEmpty) {
         debugPrint('[SaveSync] [push] No save files found on disk — nothing to upload');
-        return false;
+        return SavePushResult.skipped;
       }
       // Log what was found (paths + sizes)
       for (final entry in filesMap.entries) {
@@ -706,7 +716,7 @@ class SaveSyncService {
       debugPrint('[SaveSync] [push] After filter: ${filesMap.length} file(s) to upload');
       if (filesMap.isEmpty) {
         debugPrint('[SaveSync] [push] All files filtered out — nothing to upload');
-        return false;
+        return SavePushResult.skipped;
       }
       final keyAfterCapture = await _localSlotKey(game, strategy, romPath);
       final sourceKey = keyBeforeCapture == keyAfterCapture ? keyAfterCapture : null;
@@ -798,10 +808,8 @@ class SaveSyncService {
       final fileLen = await finalUploadFile.length();
       if (fileLen < minValidSaveSizeBytes) {
         debugPrint('[SaveSync] [push] Rejected: $displayStem is only $fileLen bytes (min=$minValidSaveSizeBytes)');
-        if (isBundle && await finalUploadFile.exists()) {
-          await finalUploadFile.delete();
-        }
-        return false;
+        await _discardBundle(finalUploadFile, isBundle);
+        return SavePushResult.skipped;
       }
 
       final String localHash = await _hashFile(finalUploadFile);
@@ -809,17 +817,15 @@ class SaveSyncService {
 
       if (!force && storedHash != null && localHash == storedHash) {
         debugPrint('[SaveSync] [push] Hash unchanged — skipping upload (already synced)');
-        if (isBundle && await finalUploadFile.exists()) {
-          await finalUploadFile.delete();
-        }
-        return true;
+        await _discardBundle(finalUploadFile, isBundle);
+        return SavePushResult.synced;
       }
 
       if (!force) {
         try {
           await _throwIfSlotLineageConflict(game, strategy, sourceKey, slot, filesMap.keys);
         } catch (_) {
-          if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
+          await _discardBundle(finalUploadFile, isBundle);
           rethrow;
         }
       }
@@ -847,9 +853,7 @@ class SaveSyncService {
           final mtime = await file.lastModified();
           if (localTime == null || mtime.isAfter(localTime)) localTime = mtime;
         }
-        if (isBundle && await finalUploadFile.exists()) {
-          await finalUploadFile.delete();
-        }
+        await _discardBundle(finalUploadFile, isBundle);
         throw SaveConflictException(
           game: game,
           localTime: localTime ?? DateTime.now(),
@@ -858,23 +862,29 @@ class SaveSyncService {
       }
 
       if (result.ok) {
-        await _storeHash(game.id, uploadFilename, localHash, slot);
-        await _recordLocalUpload(game, strategy, sourceKey, slot);
+        try {
+          await _storeHash(game.id, uploadFilename, localHash, slot);
+          await _recordLocalUpload(game, strategy, sourceKey, slot);
+        } catch (e) {
+          // RomM already accepted the save. A local metadata failure must not
+          // turn it into a retry of the unfiltered backup ZIP.
+          debugPrint('[SaveSync] [push] Could not persist local sync metadata: $e');
+        }
         debugPrint('[SaveSync] [push] Upload OK — $uploadFilename ($fileLen bytes) saved to RomM');
       } else {
         debugPrint('[SaveSync] [push] Upload FAILED — server returned ok=false');
       }
 
-      if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
+      await _discardBundle(finalUploadFile, isBundle);
       debugPrint('[SaveSync] ─── PUSH END ─── ok=${result.ok}');
-      return result.ok;
+      return result.ok ? SavePushResult.synced : SavePushResult.failed;
     } on SaveConflictException {
       rethrow;
     } on SaveSyncNotPossibleException {
       rethrow;
     } catch (e) {
       debugPrint('[SaveSync] [push] ERROR: $e');
-      return false;
+      return SavePushResult.failed;
     }
   }
 
@@ -996,13 +1006,13 @@ class SaveSyncService {
 
   /// Legacy upload path for RomM versions prior to 4.9.
   /// Uses timestamp-based conflict detection and manual save pruning.
-  Future<bool> _legacyPushSaves(Game game, String romPath,
+  Future<SavePushResult> _legacyPushSaves(Game game, String romPath,
       {required String slot, DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
     try {
       final strategy = getStrategyForGame(game, emulatorId: emulatorId);
       if (strategy == null) {
         debugPrint('[SaveSync] [push] No save strategy for slug="${game.platformSlug}"');
-        return false;
+        return SavePushResult.skipped;
       }
       debugPrint('[SaveSync] [push] Strategy: ${strategy.strategyId}  (legacy path)');
 
@@ -1023,7 +1033,7 @@ class SaveSyncService {
       }
       if (filesMap.isEmpty) {
         debugPrint('[SaveSync] [push] No save files found — nothing to upload');
-        return false;
+        return SavePushResult.skipped;
       }
 
       // If the strategy does not support zipping, filter filesMap to only keep the primary save file
@@ -1048,7 +1058,7 @@ class SaveSyncService {
         }
         filesMap = filteredMap;
       }
-      if (filesMap.isEmpty) return false;
+      if (filesMap.isEmpty) return SavePushResult.skipped;
       final keyAfterCapture = await _localSlotKey(game, strategy, romPath);
       final sourceKey = keyBeforeCapture == keyAfterCapture ? keyAfterCapture : null;
 
@@ -1140,8 +1150,8 @@ class SaveSyncService {
       final fileLen = await finalUploadFile.length();
       if (fileLen < minValidSaveSizeBytes) {
         debugPrint('[SaveSync] [push] Rejected: $displayStem is only $fileLen bytes (min=$minValidSaveSizeBytes)');
-        if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
-        return false;
+        await _discardBundle(finalUploadFile, isBundle);
+        return SavePushResult.skipped;
       }
 
       final String localHash = await _hashFile(finalUploadFile);
@@ -1149,8 +1159,8 @@ class SaveSyncService {
 
       if (!force && storedHash != null && localHash == storedHash) {
         debugPrint('[SaveSync] [push] Hash unchanged — skipping upload');
-        if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
-        return true; 
+        await _discardBundle(finalUploadFile, isBundle);
+        return SavePushResult.synced;
       }
 
       // Upload with autocleanup and overwrite.
@@ -1162,7 +1172,7 @@ class SaveSyncService {
         try {
           await _throwIfSlotLineageConflict(game, strategy, sourceKey, slot, filesMap.keys);
         } catch (_) {
-          if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
+          await _discardBundle(finalUploadFile, isBundle);
           rethrow;
         }
       }
@@ -1180,24 +1190,30 @@ class SaveSyncService {
 
       if (result.ok) {
         uploaded++;
-        await _storeHash(game.id, uploadFilename, localHash, slot);
-        await _recordLocalUpload(game, strategy, sourceKey, slot);
+        try {
+          await _storeHash(game.id, uploadFilename, localHash, slot);
+          await _recordLocalUpload(game, strategy, sourceKey, slot);
+        } catch (e) {
+          // RomM already accepted the save. A local metadata failure must not
+          // turn it into a retry of the unfiltered backup ZIP.
+          debugPrint('[SaveSync] [push] Could not persist local sync metadata: $e');
+        }
         debugPrint('[SaveSync] [push] Upload OK — $uploadFilename ($fileLen bytes) saved to RomM');
       } else {
         debugPrint('[SaveSync] [push] Upload FAILED');
       }
 
-      if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
+      await _discardBundle(finalUploadFile, isBundle);
 
       debugPrint('[SaveSync] ─── PUSH END ─── ok=${uploaded > 0}');
-      return uploaded > 0;
+      return uploaded > 0 ? SavePushResult.synced : SavePushResult.failed;
     } on SaveConflictException {
       rethrow;
     } on SaveSyncNotPossibleException {
       rethrow;
     } catch (e) {
       debugPrint('[SaveSync] [push] ERROR: $e');
-      return false;
+      return SavePushResult.failed;
     }
   }
 

@@ -37,6 +37,7 @@ Freegosy is a cross-platform Flutter app for browsing a RomM library, downloadin
 - `lib/core/save/backup_repository.dart` — BackupRepository. Opens the 'freegosy_backups' Hive box. Methods: getEntries(), addEntry() (enforces 8-cap rotation + disk cleanup), removeEntry(), markAsSynced(), getUnsyncedEntries().
 - `lib/core/save/backup_service.dart` — BackupService. Methods: createImmediate() (reuses ZipFileEncoder pipeline from SaveSyncService, writes to getApplicationSupportDirectory()/backups/), restore() (extracts chosen zip back to save dir using archive package).
 - `lib/core/save/background_sync_queue.dart` — BackgroundSyncQueue. Processes unsynced local backups serially with a 5-second throttle. Triggered on app startup and network reconnection.
+- `lib/core/save/save_operation_lock.dart` — Per-game FIFO lock shared by normal save sync, the post-exit backup pipeline and background retries. Explicit leases permit awaited nested calls without allowing independent background work to bypass the queue.
 - `lib/core/save/strategies/ares_save_strategy.dart` — Ares emulator save strategy. Per-platform extension classification (confirmed/defaulted/log-only). Stem-prefix filename matching. Fresh-install directory creation. 30 platform slugs mapped to folder names.
 - `lib/core/save/strategies/retroarch_save_strategy.dart` — RetroArch save strategy. Handles dual-stem matching for states.
 - `lib/core/save/strategies/dolphin_save_strategy.dart` — Dolphin save strategy (GC/Wii).
@@ -208,6 +209,7 @@ class GamepadUtils {
 - Issue-specific tests: `test/unit/<issue>_<feature>_test.dart` (appimage_detection, download_extension, etc.)
 
 ### Key Test Files (713 tests as of v0.5.10-pre)
+- `game_launch_service_backup_sync_test.dart`, `save_push_result_test.dart`, `save_operation_lock_test.dart`, `test/core/save/background_sync_queue_race_test.dart` — Restart-safe backup eligibility, explicit push outcomes, per-game coordination and retry races. Shared launch fixtures: `test/helpers/game_launch_service_fakes.dart`.
 - `controller_settings_regression_test.dart` — 94 tests: built-in mappings, POV decoding, SDL parsing, custom mapping persistence, deadzone config, PS4/PS5 USB controller entries, empty-token fallback
 - `ares_strategy_test.dart` — 14 tests: getSystemNameForSlug, supportedSlugs, launch args regression (no --fullscreen/--no-file-prompt), unsupported platform throws
 - `ares_save_strategy_test.dart` — 34 tests: extension classification, state file exclusion, stem-prefix matching, restoreSave directory creation

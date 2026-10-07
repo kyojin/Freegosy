@@ -85,24 +85,63 @@ class BackupRepository {
   /// Marks a specific [entry] as synced.
   Future<void> markAsSynced(String romId, BackupEntry entry) async {
     final entries = getEntries(romId);
-    final index = entries.indexWhere((e) =>
-        e.localZipPath == entry.localZipPath &&
-        e.timestamp == entry.timestamp);
+    final index = entries.indexWhere(
+      (e) =>
+          e.localZipPath == entry.localZipPath &&
+          e.timestamp == entry.timestamp,
+    );
     if (index != -1) {
-      final old = entries[index];
-      entries[index] = BackupEntry(
-        timestamp: old.timestamp,
-        md5Hash: old.md5Hash,
-        localZipPath: old.localZipPath,
-        isSynced: true,
-      );
+      entries[index] = _asSynced(entries[index]);
       await _openBox.put(romId, entries);
     }
+  }
+
+  /// Acknowledge only the retry snapshots captured before an upload began.
+  /// Entries added while it was running remain eligible, even if their clock
+  /// timestamps match. Restore-point files are kept.
+  Future<void> acknowledgeEntries(
+    String romId,
+    List<BackupEntry> covered,
+  ) async {
+    if (covered.isEmpty) return;
+    final keys = covered
+        .map((e) => (e.localZipPath, e.timestamp, e.md5Hash))
+        .toSet();
+    final entries = getEntries(romId);
+    var changed = false;
+    for (var i = 0; i < entries.length; i++) {
+      final entry = entries[i];
+      if (!entry.isSynced &&
+          keys.contains((entry.localZipPath, entry.timestamp, entry.md5Hash))) {
+        entries[i] = _asSynced(entry);
+        changed = true;
+      }
+    }
+    if (changed) await _openBox.put(romId, entries);
+  }
+
+  /// Prefer the latest timestamp, keeping insertion order for ties.
+  BackupEntry? newestPending(String romId) {
+    BackupEntry? newest;
+    for (final entry in getEntries(romId)) {
+      if (!entry.isSynced &&
+          (newest == null || entry.timestamp.isAfter(newest.timestamp))) {
+        newest = entry;
+      }
+    }
+    return newest;
   }
 
   // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
+
+  static BackupEntry _asSynced(BackupEntry entry) => BackupEntry(
+    timestamp: entry.timestamp,
+    md5Hash: entry.md5Hash,
+    localZipPath: entry.localZipPath,
+    isSynced: true,
+  );
 
   Future<void> _deleteFile(String path) async {
     try {

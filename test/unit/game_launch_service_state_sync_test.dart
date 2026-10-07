@@ -1,4 +1,3 @@
-import 'dart:io' as io;
 
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -8,7 +7,6 @@ import 'package:freegosy/core/romm/romm_models.dart';
 import 'package:freegosy/core/romm/romm_service.dart';
 import 'package:freegosy/core/save/backup_repository.dart';
 import 'package:freegosy/core/save/backup_service.dart';
-import 'package:freegosy/core/save/save_strategy.dart';
 import 'package:freegosy/core/save/save_sync_service.dart';
 import 'package:freegosy/core/save/state_sync_service.dart';
 import 'package:freegosy/core/storage/app_preferences.dart';
@@ -17,6 +15,7 @@ import 'package:freegosy/core/storage/shared_preferences_app_preferences.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/fake_romm_states_api.dart';
+import '../helpers/game_launch_service_fakes.dart';
 
 /// A StateSyncService whose pushStates throws, like an unexpected failure.
 class _ThrowingStateSync extends StateSyncService {
@@ -58,57 +57,6 @@ class _ConflictingStateSync extends StateSyncService {
         );
     return StateSyncResult(conflicts: [conflict('a.p2s'), conflict('b.p2s')]);
   }
-}
-
-/// A process that has already exited with code 0.
-class _ExitedProcess implements io.Process {
-  @override
-  Future<int> get exitCode => Future.value(0);
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
-
-/// A SaveSyncService whose pushSaves only records that it ran.
-class _RecordingSaveSync extends SaveSyncService {
-  _RecordingSaveSync(super.romm, super.dirs, super.registry, super.prefs, this.log, {this.blockedReason});
-  final List<String> log;
-
-  /// When set, pushSaves reports that saves can't be synced, like a
-  /// strategy's saveSyncBlockedReason does.
-  final String? blockedReason;
-
-  @override
-  Future<bool> pushSaves(Game game, String romPath,
-      {DateTime? sessionStart,
-      String syncMode = 'both',
-      bool force = false,
-      String? coreOverride,
-      String? emulatorId}) async {
-    log.add('push');
-    if (blockedReason != null) throw SaveSyncNotPossibleException(blockedReason!);
-    return true;
-  }
-}
-
-/// A GameLaunchService whose save push appends 'push' to [log].
-Future<GameLaunchService> _launchServiceLogging(List<String> log, {String? blockedReason}) async {
-  SharedPreferences.setMockInitialValues({});
-  final prefs = SharedPreferencesAppPreferences(await SharedPreferences.getInstance());
-  final dirService = DirectoryService(prefs);
-  final registry = StrategyRegistry(dirService, prefs);
-  final rommService = RommService(
-    RomMConfig(baseUrl: 'https://romm.example.com', username: '', password: '', apiKey: 'k'),
-    dio: Dio(BaseOptions(baseUrl: 'https://romm.example.com')),
-    skipConnectivityCheck: true,
-  );
-  return GameLaunchService(
-    directoryService: dirService,
-    strategyRegistry: registry,
-    saveSyncService: _RecordingSaveSync(rommService, dirService, registry, prefs, log, blockedReason: blockedReason),
-    backupService: BackupService(),
-    backupRepository: BackupRepository(),
-    prefs: prefs,
-  );
 }
 
 /// A GameLaunchService wired to real (in-memory) collaborators and [stateSync].
@@ -215,7 +163,7 @@ void main() {
   });
   group('awaitExitAndSync onExited', () {
     GameSession exited() => GameSession(
-          process: _ExitedProcess(),
+          process: ExitedTestProcess(),
           sessionStart: DateTime(2026, 1, 1),
           emulatorId: 'pcsx2',
           activityTrackerFuture: Future.value(null),
@@ -223,7 +171,7 @@ void main() {
 
     test('is called once, right after the exit and before the save push', () async {
       final log = <String>[];
-      final service = await _launchServiceLogging(log);
+      final service = await launchServiceLogging(log);
 
       final result = await service.awaitExitAndSync(exited(), _game, 'Ico.iso',
           syncMode: 'both', onExited: () => log.add('exited'));
@@ -234,7 +182,7 @@ void main() {
 
     test('a throwing onExited does not stop the pipeline', () async {
       final log = <String>[];
-      final service = await _launchServiceLogging(log);
+      final service = await launchServiceLogging(log);
 
       final result = await service.awaitExitAndSync(exited(), _game, 'Ico.iso',
           syncMode: 'both', onExited: () => throw StateError('listener exploded'));
@@ -245,7 +193,7 @@ void main() {
 
     test('saves that cannot be synced are reported in the result, and the pipeline goes on', () async {
       final log = <String>[];
-      final service = await _launchServiceLogging(log, blockedReason: 'one shared card');
+      final service = await launchServiceLogging(log, blockedReason: 'one shared card');
 
       final result = await service.awaitExitAndSync(exited(), _game, 'Ico.iso',
           syncMode: 'both', onExited: () => log.add('exited'));
