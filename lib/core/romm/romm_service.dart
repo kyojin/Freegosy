@@ -20,8 +20,14 @@ class RommService implements RommStatesApi {
   final ValueNotifier<bool> isOffline = ValueNotifier(false);
   Timer? _heartbeatTimer;
   final PlatformInfo _platform;
+  final AppPreferences? _prefs;
 
   RomMConfig get config => _config;
+
+  /// Read preferences at the start of each save operation so retained clients
+  /// (e.g. a running game or offline queue) see changes made in Settings.
+  String get saveSlot => RomMConfig.normalizeSaveSlot(
+      _prefs?.getString(RomMConfig.saveSlotPreferenceKey) ?? _config.saveSlot);
 
   static String get _ua => 'Freegosy/${AppConstants.version}';
 
@@ -40,7 +46,7 @@ class RommService implements RommStatesApi {
   /// former without also silencing the latter.
   static bool _isConnectivityHeartbeat(String path) => path == '/api/heartbeat';
 
-  RommService(this._config, {Dio? dio, PlatformInfo? platform, bool skipConnectivityCheck = false})
+  RommService(this._config, {Dio? dio, PlatformInfo? platform, AppPreferences? prefs, bool skipConnectivityCheck = false})
       : _dio = dio ?? Dio(BaseOptions(
           baseUrl: _normalizeBaseUrl(_config.baseUrl),
           connectTimeout: const Duration(seconds: 30),
@@ -51,7 +57,8 @@ class RommService implements RommStatesApi {
           },
         )),
         _authOptions = _computeAuthOptions(_config),
-        _platform = platform ?? PlatformInfo.current {
+        _platform = platform ?? PlatformInfo.current,
+        _prefs = prefs {
     
     if (dio != null) {
       _dio.options.baseUrl = _normalizeBaseUrl(_config.baseUrl);
@@ -649,15 +656,12 @@ class RommService implements RommStatesApi {
     try {
       final uploadFilename = overrideFilename ?? saveFile.uri.pathSegments.last;
 
-      // Slot naming: always use 'freegosy' for consistency.
-      // Previously used timestamped slots like 'freegosy-srm_2026-07-11_08-45-38'
-      // which created duplicate records on RomM and caused the filename to be
-      // corrupted with timestamps. RomM's autocleanup handles version pruning.
-      // Do NOT add timestamps to the slot — it breaks save sync (issues #42, #28).
+      // Keep the configured slot stable across uploads. Timestamped slot names
+      // create duplicate lineages and break save sync (issues #42, #28).
       final queryParams = <String, dynamic>{
         'rom_id': gameId,
         'emulator': emulator ?? 'freegosy',
-        'slot': slot ?? 'freegosy',
+        'slot': slot ?? saveSlot,
       };
       // Autocleanup and overwrite are now available for ALL paths (not just 4.9+).
       // This ensures legacy RomM instances also get proper save management.
@@ -722,13 +726,14 @@ class RommService implements RommStatesApi {
 
   Future<void> pruneOldSaves(String gameId, {int keepCount = 5}) async {
     try {
+      final slot = saveSlot;
       final saves = await getSavesList(gameId);
-      // Freegosy's saves are the ones in its slot; their emulator tag names
-      // the emulator that made them.
-      final freegosySaves = saves.where((s) => (s['slot']?.toString() ?? '') == 'freegosy').toList();
-      if (freegosySaves.length <= keepCount) return;
+      // Only prune the configured slot; leave every other lineage untouched.
+      final slotSaves = saves.where((s) => s['slot']?.toString() == slot).toList();
+      slotSaves.sort((a, b) => _saveUpdatedTime(b).compareTo(_saveUpdatedTime(a)));
+      if (slotSaves.length <= keepCount) return;
       
-      final toDelete = freegosySaves.sublist(keepCount);
+      final toDelete = slotSaves.sublist(keepCount);
       final idsToDelete = toDelete
           .map((s) => int.tryParse(s['id']?.toString() ?? ''))
           .whereType<int>()
@@ -747,10 +752,13 @@ class RommService implements RommStatesApi {
   ///
   /// Pass [deviceId] (RomM 4.9+) to receive `device_syncs[]` with `is_current`
   /// on each save. Pass [slot] to filter to a specific slot.
+  /// [requireSuccess] distinguishes an empty slot from a failed/malformed
+  /// query when a caller is deciding whether it is safe to upload.
   Future<List<Map<String, dynamic>>> getSavesList(
     String gameId, {
     String? deviceId,
     String? slot,
+    bool requireSuccess = false,
   }) async {
     try {
       final params = <String, dynamic>{'rom_id': gameId};
@@ -759,11 +767,18 @@ class RommService implements RommStatesApi {
 
       final response =
           await _dio.get('/api/saves', queryParameters: params, options: _authOptions);
-      if (response.statusCode != 200) return [];
-      final List<dynamic> items =
-          (response.data is Map && response.data.containsKey('items'))
-              ? response.data['items']
-              : (response.data is List ? response.data : []);
+      if (response.statusCode != 200) {
+        if (requireSuccess) throw StateError('RomM could not list saves.');
+        return [];
+      }
+      final data = response.data is Map ? response.data['items'] : response.data;
+      if (requireSuccess && data is! List) {
+        throw const FormatException('RomM returned an invalid save list.');
+      }
+      final List<dynamic> items = data is List ? data : [];
+      if (requireSuccess && items.any((s) => s is! Map<String, dynamic> || s['id'] == null)) {
+        throw const FormatException('RomM returned an invalid save record.');
+      }
       final sorted =
           List<Map<String, dynamic>>.from(items.whereType<Map<String, dynamic>>());
       sorted.sort((a, b) {
@@ -777,14 +792,37 @@ class RommService implements RommStatesApi {
       });
       return sorted;
     } catch (_) {
+      if (requireSuccess) rethrow;
       return [];
     }
   }
 
-  Future<Map<String, dynamic>?> getLatestSave(String gameId, {String? deviceId}) async {
-    final items = await getSavesList(gameId, deviceId: deviceId);
-    return items.isEmpty ? null : items.first;
+  /// Prefers the newest save in the configured slot, regardless of emulator.
+  /// If that slot is empty, preserve the newest-across-slots fallback for
+  /// legacy saves and saves uploaded by other clients.
+  /// [slot] lets a caller keep its selection fixed for an in-flight operation.
+  Future<Map<String, dynamic>?> getLatestSave(String gameId,
+      {String? deviceId, String? slot, bool requireSuccess = false}) async {
+    final selectedSlot = slot ?? saveSlot;
+    final items = await getSavesList(gameId, deviceId: deviceId, requireSuccess: requireSuccess);
+    Map<String, dynamic>? latest;
+    var latestTime = DateTime(0);
+    for (final save in items) {
+      if (save['slot']?.toString() != selectedSlot) continue;
+      final time = _saveUpdatedTime(save);
+      if (latest == null || time.isAfter(latestTime)) {
+        latest = save;
+        latestTime = time;
+      }
+    }
+    return latest ?? (items.isEmpty ? null : items.first);
   }
+
+  // Overwriting a save updates its timestamp without changing its creation
+  // date. That record must remain the active version in a shared slot.
+  static DateTime _saveUpdatedTime(Map<String, dynamic> save) =>
+      DateTime.tryParse(save['updated_at']?.toString() ?? '') ??
+      DateTime.tryParse(save['created_at']?.toString() ?? '') ?? DateTime(0);
 
   /// Downloads save file bytes.
   ///

@@ -92,6 +92,17 @@ class MockRommService extends _i1.Mock implements _i6.RommService {
           as _i3.RomMConfig);
 
   @override
+  String get saveSlot =>
+      (super.noSuchMethod(
+            Invocation.getter(#saveSlot),
+            returnValue: _i7.dummyValue<String>(
+              this,
+              Invocation.getter(#saveSlot),
+            ),
+          )
+          as String);
+
+  @override
   _i3.RommCapabilities get capabilities =>
       (super.noSuchMethod(
             Invocation.getter(#capabilities),
@@ -378,12 +389,17 @@ class MockRommService extends _i1.Mock implements _i6.RommService {
     String? gameId, {
     String? deviceId,
     String? slot,
+    bool? requireSuccess = false,
   }) =>
       (super.noSuchMethod(
             Invocation.method(
               #getSavesList,
               [gameId],
-              {#deviceId: deviceId, #slot: slot},
+              {
+                #deviceId: deviceId,
+                #slot: slot,
+                #requireSuccess: requireSuccess,
+              },
             ),
             returnValue: _i8.Future<List<Map<String, dynamic>>>.value(
               <Map<String, dynamic>>[],
@@ -395,9 +411,19 @@ class MockRommService extends _i1.Mock implements _i6.RommService {
   _i8.Future<Map<String, dynamic>?> getLatestSave(
     String? gameId, {
     String? deviceId,
+    String? slot,
+    bool? requireSuccess = false,
   }) =>
       (super.noSuchMethod(
-            Invocation.method(#getLatestSave, [gameId], {#deviceId: deviceId}),
+            Invocation.method(
+              #getLatestSave,
+              [gameId],
+              {
+                #deviceId: deviceId,
+                #slot: slot,
+                #requireSuccess: requireSuccess,
+              },
+            ),
             returnValue: _i8.Future<Map<String, dynamic>?>.value(),
           )
           as _i8.Future<Map<String, dynamic>?>);

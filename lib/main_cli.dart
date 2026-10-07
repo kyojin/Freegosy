@@ -210,7 +210,7 @@ class _HeadlessSession {
       return null;
     }
 
-    final rommService = RommService(rommConfig);
+    final rommService = RommService(rommConfig, prefs: prefs);
     final strategyRegistry = StrategyRegistry(directoryService, prefs);
     final saveSyncService = SaveSyncService(rommService, directoryService, strategyRegistry, prefs);
     final stateSyncService = StateSyncService(rommService, prefs, saveSyncService.getStrategyForGame);

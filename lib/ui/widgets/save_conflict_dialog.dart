@@ -7,6 +7,7 @@ class SaveConflictDialog extends StatelessWidget {
   final String _gameName;
   final DateTime _localTime;
   final DateTime _cloudTime;
+  final String? _targetSlot;
 
   /// What the two copies are, as it reads in the dialog sentence
   /// (`...local and cloud $subject have been modified`).
@@ -16,12 +17,14 @@ class SaveConflictDialog extends StatelessWidget {
       : _gameName = conflict.game.name,
         _localTime = conflict.localTime,
         _cloudTime = conflict.cloudTime,
+        _targetSlot = conflict.targetSlot,
         _subject = 'saves';
 
   SaveConflictDialog.forState({super.key, required StateConflict conflict})
       : _gameName = conflict.game.name,
         _localTime = conflict.localTime,
         _cloudTime = conflict.cloudTime,
+        _targetSlot = null,
         _subject = 'versions of save state "${conflict.fileName}"';
 
   @override
@@ -41,7 +44,10 @@ class SaveConflictDialog extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Both local and cloud $_subject have been modified for $_gameName. Please choose which version to keep.',
+            _targetSlot == null
+                ? 'Both local and cloud $_subject have been modified for $_gameName. Please choose which version to keep.'
+                : 'The "$_targetSlot" RomM slot already has a save for $_gameName. '
+                    'Choose whether to replace it with this PC’s save or restore the cloud save.',
             style: const TextStyle(fontSize: 14),
           ),
           const SizedBox(height: 24),

@@ -467,12 +467,31 @@ class RommCapabilities {
 }
 
 class RomMConfig {
+  static const defaultSaveSlot = 'freegosy';
+  static const saveSlotPreferenceKey = 'rommSaveSlot';
+  // RomM stores Save.slot in a VARCHAR(255) column.
+  static const maxSaveSlotLength = 255;
+
+  /// Slot names are stable and case-sensitive. Blank values use the default.
+  static String normalizeSaveSlot(String? value) {
+    final slot = value?.trim() ?? '';
+    return slot.isEmpty ? defaultSaveSlot : slot;
+  }
+
+  static String? validateSaveSlot(String? value) {
+    if (normalizeSaveSlot(value).runes.length > maxSaveSlotLength) {
+      return 'Use $maxSaveSlotLength characters or fewer.';
+    }
+    return null;
+  }
+
   final String baseUrl;
   final String username;
   final String password;
   final String? token;
   final String apiKey;
   final bool trustSelfSigned;
+  final String saveSlot;
 
   RomMConfig({
     required this.baseUrl,
@@ -481,7 +500,8 @@ class RomMConfig {
     this.token,
     this.apiKey = '',
     this.trustSelfSigned = false,
-  });
+    String? saveSlot,
+  }) : saveSlot = normalizeSaveSlot(saveSlot);
 
   factory RomMConfig.fromJson(Map<String, dynamic> json) {
     return RomMConfig(
@@ -491,6 +511,7 @@ class RomMConfig {
       token: json['token']?.toString(),
       apiKey: json['apiKey']?.toString() ?? '',
       trustSelfSigned: json['trustSelfSigned'] == true,
+      saveSlot: json['saveSlot']?.toString(),
     );
   }
 
@@ -502,6 +523,7 @@ class RomMConfig {
       if (token != null) 'token': token,
       'apiKey': apiKey,
       'trustSelfSigned': trustSelfSigned,
+      'saveSlot': saveSlot,
     };
   }
 
@@ -512,6 +534,7 @@ class RomMConfig {
     String? token,
     String? apiKey,
     bool? trustSelfSigned,
+    String? saveSlot,
   }) {
     return RomMConfig(
       baseUrl: baseUrl ?? this.baseUrl,
@@ -520,6 +543,7 @@ class RomMConfig {
       token: token ?? this.token,
       apiKey: apiKey ?? this.apiKey,
       trustSelfSigned: trustSelfSigned ?? this.trustSelfSigned,
+      saveSlot: saveSlot ?? this.saveSlot,
     );
   }
 }

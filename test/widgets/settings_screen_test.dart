@@ -49,11 +49,15 @@ void main() {
     when(mockStrategyRegistry.getStrategyById(any)).thenReturn(null);
   });
 
-  Widget createSettingsScreen() {
+  Widget createSettingsScreen({void Function()? onRommServiceCreated}) {
     return ProviderScope(
       overrides: [
         sharedPreferencesProvider.overrideWithValue(prefs),
-        rommServiceProvider.overrideWithValue(mockRommService),
+        rommServiceProvider.overrideWith((ref) {
+          ref.watch(rommConfigProvider);
+          onRommServiceCreated?.call();
+          return mockRommService;
+        }),
         directoryServiceProvider.overrideWith((ref) => Future.value(mockDirectoryService)),
         strategyRegistryProvider.overrideWith((ref) => Future.value(mockStrategyRegistry)),
         rommConfigProvider.overrideWith((ref) => Future.value(RomMConfig(
@@ -72,6 +76,89 @@ void main() {
   }
 
   group('SettingsScreen', () {
+    testWidgets('saving the slot keeps the existing RomM connection', (tester) async {
+      var serviceCreations = 0;
+      await tester.pumpWidget(createSettingsScreen(
+        onRommServiceCreated: () => serviceCreations++,
+      ));
+      await tester.pumpAndSettle();
+      final initialCreations = serviceCreations;
+      expect(initialCreations, greaterThan(0));
+      final field = find.byKey(const ValueKey('rommSaveSlot'));
+      await tester.ensureVisible(field);
+      await tester.enterText(field, 'autosave');
+      final save = find.text('Save slot');
+      await tester.ensureVisible(save);
+      await tester.tap(save);
+      await tester.pumpAndSettle();
+      expect(serviceCreations, initialCreations);
+      expect(prefs.getString(RomMConfig.saveSlotPreferenceKey), 'autosave');
+    });
+
+    testWidgets('rejects an overlong RomM slot without changing the setting', (tester) async {
+      await prefs.setString(RomMConfig.saveSlotPreferenceKey, 'autosave');
+      await tester.pumpWidget(createSettingsScreen());
+      await tester.pumpAndSettle();
+      final field = find.byKey(const ValueKey('rommSaveSlot'));
+      final save = find.text('Save slot');
+      await tester.ensureVisible(field);
+      await tester.enterText(field, 'x' * 256);
+      await tester.ensureVisible(save);
+      await tester.tap(save);
+      await tester.pumpAndSettle();
+      expect(find.text('Use 255 characters or fewer.'), findsOneWidget);
+      expect(prefs.getString(RomMConfig.saveSlotPreferenceKey), 'autosave');
+      expect(find.text('RomM save slot saved.'), findsNothing);
+
+      await tester.ensureVisible(field);
+      await tester.enterText(field, 'custom');
+      await tester.pump();
+      expect(find.text('Use 255 characters or fewer.'), findsNothing);
+      await tester.ensureVisible(save);
+      await tester.tap(save);
+      await tester.pumpAndSettle();
+      expect(prefs.getString(RomMConfig.saveSlotPreferenceKey), 'custom');
+    });
+
+    testWidgets('RomM save slot defaults to freegosy and persists autosave across reopen', (tester) async {
+      await tester.pumpWidget(createSettingsScreen());
+      await tester.pumpAndSettle();
+      final field = find.byKey(const ValueKey('rommSaveSlot'));
+      await tester.ensureVisible(field);
+      expect(tester.widget<TextField>(field).controller!.text, 'freegosy');
+
+      await tester.enterText(field, ' autosave ');
+      final save = find.text('Save slot');
+      await tester.ensureVisible(save);
+      await tester.tap(save);
+      await tester.pumpAndSettle();
+      expect(prefs.getString(RomMConfig.saveSlotPreferenceKey), 'autosave');
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpWidget(createSettingsScreen());
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(field);
+      expect(tester.widget<TextField>(field).controller!.text, 'autosave');
+    });
+
+    testWidgets('RomM save slot accepts custom names and resets blank to the default', (tester) async {
+      await tester.pumpWidget(createSettingsScreen());
+      await tester.pumpAndSettle();
+      final field = find.byKey(const ValueKey('rommSaveSlot'));
+      final save = find.text('Save slot');
+
+      for (final value in ['My playthrough', ' ']) {
+        await tester.ensureVisible(field);
+        await tester.enterText(field, value);
+        await tester.ensureVisible(save);
+        await tester.tap(save);
+        await tester.pumpAndSettle();
+        final expected = value.trim().isEmpty ? 'freegosy' : value;
+        expect(prefs.getString(RomMConfig.saveSlotPreferenceKey), expected);
+        expect(tester.widget<TextField>(field).controller!.text, expected);
+      }
+    });
+
     testWidgets('renders server configuration fields', (WidgetTester tester) async {
       await tester.pumpWidget(createSettingsScreen());
       await tester.pumpAndSettle();
@@ -89,7 +176,11 @@ void main() {
       await tester.pumpWidget(createSettingsScreen());
       await tester.pumpAndSettle();
 
+      await tester.scrollUntilVisible(find.textContaining('/roms'), 300,
+          scrollable: find.byType(Scrollable).first);
       expect(find.textContaining('roms'), findsWidgets);
+      await tester.scrollUntilVisible(find.textContaining('/emulators'), 300,
+          scrollable: find.byType(Scrollable).first);
       expect(find.textContaining('emulators'), findsWidgets);
     });
 
@@ -140,8 +231,11 @@ void main() {
       // Find the Show game title toggle card and tap it
       final toggleText = find.text('Show game title');
       expect(toggleText, findsOneWidget);
+      await tester.ensureVisible(toggleText);
+      await tester.pumpAndSettle();
       await tester.tap(toggleText);
       await tester.pumpAndSettle();
+      expect(prefs.getBool('show_title'), isFalse);
     });
 
     testWidgets('combo selector dialog can be dismissed using GameAction.back', (WidgetTester tester) async {

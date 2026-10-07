@@ -608,6 +608,23 @@ void main() {
   });
 
   group('SaveConflictDialog edge cases', () {
+    testWidgets('slot conflicts identify the occupied slot without claiming both saves changed', (tester) async {
+      final conflict = SaveConflictException(
+        game: Game(id: '1', name: 'Test', fileSize: 0),
+        localTime: DateTime.utc(2025, 1, 1),
+        cloudTime: DateTime.utc(2025, 1, 2),
+        targetSlot: 'autosave',
+      );
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(body: SaveConflictDialog(conflict: conflict)),
+      ));
+      expect(find.textContaining('"autosave" RomM slot already has a save'), findsOneWidget);
+      expect(find.textContaining('Both local and cloud'), findsNothing);
+      expect(find.text('Use Local Version'), findsOneWidget);
+      expect(find.text('Use Cloud Version'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+
     testWidgets('same timestamps does not crash and neither shows NEWER', (tester) async {
       final now = DateTime.now();
       final conflict = SaveConflictException(

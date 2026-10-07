@@ -1,4 +1,5 @@
 import 'dart:io' as io;
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
@@ -35,6 +36,8 @@ class SaveConflictException implements Exception {
   final DateTime cloudTime;
   final String? localScreenshot;
   final String? cloudScreenshot;
+  /// The occupied target slot when the local save has a different lineage.
+  final String? targetSlot;
   
   SaveConflictException({
     required this.game, 
@@ -42,6 +45,7 @@ class SaveConflictException implements Exception {
     required this.cloudTime,
     this.localScreenshot,
     this.cloudScreenshot,
+    this.targetSlot,
   });
   
   @override
@@ -257,22 +261,35 @@ class SaveSyncService {
     return null;
   }
 
-  String _hashKey(String gameId, String filename) =>
-      'last_hash_${gameId}_$filename';
+  /// The RomM lineage used by pushes, automatic pulls, and their caches.
+  String get saveSlot => RomMConfig.normalizeSaveSlot(
+      _prefs.getString(RomMConfig.saveSlotPreferenceKey) ??
+          _rommService.config.saveSlot);
+
+  // Keep existing cache keys for the default slot. Other slots have separate
+  // history so switching slots cannot suppress an unchanged upload or pull.
+  String _hashPrefix(String gameId, String slot) =>
+      slot == RomMConfig.defaultSaveSlot
+      ? 'last_hash_${gameId}_'
+      : 'last_hash_slot_${Uri.encodeComponent(slot)}:${Uri.encodeComponent(gameId)}:';
+
+  String _hashKey(String gameId, String filename, String slot) =>
+      '${_hashPrefix(gameId, slot)}$filename';
 
   String? _getStoredHash(
-      String gameId, String filename) {
-    return _prefs.getString(_hashKey(gameId, filename));
+      String gameId, String filename, String slot) {
+    return _prefs.getString(_hashKey(gameId, filename, slot));
   }
 
   Future<void> _storeHash(
-      String gameId, String filename, String hash) async {
-    await _prefs.setString(_hashKey(gameId, filename), hash);
+      String gameId, String filename, String hash, String slot) async {
+    await _prefs.setString(_hashKey(gameId, filename, slot), hash);
   }
 
-  /// Clears the stored hash for a game, forcing the next push to upload.
+  /// Clears the stored hash for a game in the active slot, forcing its next push.
   Future<void> clearHashCache(String gameId) async {
-    final keys = _prefs.getKeys().where((k) => k.startsWith('last_hash_${gameId}_')).toList();
+    final prefix = _hashPrefix(gameId, saveSlot);
+    final keys = _prefs.getKeys().where((k) => k.startsWith(prefix)).toList();
     for (final key in keys) {
       await _prefs.remove(key);
     }
@@ -334,20 +351,161 @@ class SaveSyncService {
     return null;
   }
 
-  String _pullKey(String gameId) =>
-      'last_pull_$gameId';
+  String _pullKey(String gameId, String slot) =>
+      slot == RomMConfig.defaultSaveSlot
+      ? 'last_pull_$gameId'
+      : 'last_pull_slot_${Uri.encodeComponent(slot)}:${Uri.encodeComponent(gameId)}';
 
-  DateTime? _getLastPullTime(String gameId) {
-    final stored = _prefs.getString(_pullKey(gameId));
+  DateTime? _getLastPullTime(String gameId, String slot) {
+    final stored = _prefs.getString(_pullKey(gameId, slot));
     if (stored == null) return null;
     return DateTime.tryParse(stored);
   }
 
-  Future<void> _setLastPullTime(String gameId) async {
+  Future<void> _setLastPullTime(String gameId, String slot) async {
     await _prefs.setString(
-      _pullKey(gameId),
+      _pullKey(gameId, slot),
       DateTime.now().toIso8601String(),
     );
+  }
+
+  // All cloud slots restore into the same emulator files. Historical sync
+  // timestamps only prove freshness while that lineage is still on disk.
+  String _localSlotPrefix(Game game, SaveStrategy strategy) =>
+      'local_save_slot_${Uri.encodeComponent(game.id)}:${Uri.encodeComponent(strategy.strategyId)}:';
+
+  Future<String> _localSlotKey(Game game, SaveStrategy strategy, String romPath) async {
+    final prefix = _localSlotPrefix(game, strategy);
+    // Windows archives can override a Wiki-discovered path via savePath.
+    // Only an explicit manual override makes this lookup authoritative.
+    if (strategy is WindowsSaveStrategy &&
+        (strategy.getManualOverride(game.id)?.isEmpty ?? true)) {
+      return '${prefix}unresolved';
+    }
+    String? saveDir;
+    try {
+      saveDir = await strategy.getSaveDir(game, romPath);
+    } on SaveMappingRequiredException {
+      // Some strategies can discover the target from the downloaded archive.
+    }
+    if (saveDir == null) return '${prefix}unresolved';
+    String path;
+    try {
+      path = await io.Directory(saveDir).resolveSymbolicLinks();
+    } on io.FileSystemException {
+      // First restores can target a directory that does not exist yet.
+      path = p.normalize(p.absolute(saveDir));
+    }
+    final pathHash = md5.convert(utf8.encode(path));
+    return '$prefix$pathHash';
+  }
+
+  Future<bool> _localSlotMatches(Game game, SaveStrategy strategy, String romPath,
+      Map<String, dynamic> save, String syncSlot) async {
+    final key = await _localSlotKey(game, strategy, romPath);
+    return _localSlotMatchesKey(game, strategy, key, save, syncSlot);
+  }
+
+  bool _localSlotMatchesKey(Game game, SaveStrategy strategy, String? key,
+      Map<String, dynamic> save, String syncSlot) {
+    if (key == null) return false;
+    final installed = _prefs.getString(key);
+    // Keep the previous freshness behavior for existing default-slot installs
+    // until this version records a successful push or restore.
+    if (installed == null) {
+      return syncSlot == RomMConfig.defaultSaveSlot &&
+          !_prefs.getKeys().any((k) => k.startsWith(_localSlotPrefix(game, strategy)));
+    }
+    return installed == jsonEncode(save['slot']?.toString());
+  }
+
+  Future<void> _recordLocalSlot(Game game, SaveStrategy strategy,
+      String romPath, String? slot) =>
+      _writeLocalSlot(game, strategy, romPath, jsonEncode(slot));
+
+  Future<void> _writeLocalSlot(Game game, SaveStrategy strategy,
+      String romPath, String value, {bool invalidate = false}) async {
+    final key = await _localSlotKey(game, strategy, romPath);
+    final prefix = _localSlotPrefix(game, strategy);
+    await _writeLocalSlotKey(key, prefix, value, invalidate: invalidate);
+  }
+
+  Future<void> _writeLocalSlotKey(String key, String prefix, String value,
+      {bool invalidate = false}) async {
+    final unresolvedKey = '${prefix}unresolved';
+    final clearUnresolved = key != unresolvedKey && _prefs.getString(unresolvedKey) != null;
+    if (clearUnresolved && !await _prefs.setString(unresolvedKey, '{}')) {
+      throw StateError('Could not invalidate the local save lineage.');
+    }
+    if (!await _prefs.setString(key, value)) {
+      throw StateError('Could not persist the local save lineage.');
+    }
+    if (clearUnresolved && !await _prefs.remove(unresolvedKey)) {
+      throw StateError('Could not invalidate the local save lineage.');
+    }
+    if (invalidate && key == unresolvedKey) {
+      // The archive may restore into any previously known directory. Do not
+      // retain an old marker for a target we cannot currently identify.
+      final oldKeys = _prefs.getKeys().where((k) => k != key && k.startsWith(prefix)).toList();
+      for (final oldKey in oldKeys) {
+        if (!await _prefs.remove(oldKey)) {
+          throw StateError('Could not invalidate the local save lineage.');
+        }
+      }
+    }
+  }
+
+  Future<void> _recordLocalUpload(Game game, SaveStrategy strategy,
+      String? sourceKey, String slot) async {
+    final prefix = _localSlotPrefix(game, strategy);
+    // Uploads read local files without changing them. If the directory changed
+    // during capture, do not claim ownership of any particular target.
+    await _writeLocalSlotKey(sourceKey ?? '${prefix}unresolved', prefix,
+        sourceKey == null ? '{}' : jsonEncode(slot));
+  }
+
+  Future<void> _throwIfSlotLineageConflict(Game game, SaveStrategy strategy,
+      String? sourceKey, String slot, Iterable<io.File> files) async {
+    if (_localSlotMatchesKey(game, strategy, sourceKey, {'slot': slot}, slot)) return;
+    // An occupied slot is a separate lineage until it has reached local disk.
+    // A failed query must not be mistaken for an empty slot and allow a push.
+    final remote = await _rommService.getLatestSave(game.id,
+        slot: slot, requireSuccess: true);
+    if (remote == null || remote['slot']?.toString() != slot) return;
+    DateTime? localTime;
+    for (final file in files) {
+      final modified = (await io.FileStat.stat(file.path)).modified;
+      if (localTime == null || modified.isAfter(localTime)) localTime = modified;
+    }
+    throw SaveConflictException(
+      game: game,
+      localTime: localTime ?? DateTime.now(),
+      cloudTime: DateTime.tryParse(remote['updated_at']?.toString() ?? '') ??
+          DateTime.tryParse(remote['created_at']?.toString() ?? '') ?? DateTime.now(),
+      cloudScreenshot: (remote['screenshot_path'] ?? remote['screenshot_url'])?.toString(),
+      targetSlot: slot,
+    );
+  }
+
+  // Shared across service instances: settings changes can recreate providers
+  // while an old instance is still uploading. Serialize each game's syncs so
+  // a delayed push cannot mark a newer restore as belonging to its old slot.
+  static final Map<String, Future<void>> _pendingGameSyncs = {};
+
+  static Future<T> _runGameSync<T>(String gameId, Future<T> Function() body) async {
+    final previous = _pendingGameSyncs[gameId] ?? Future<void>.value();
+    final finished = Completer<void>();
+    final tail = finished.future;
+    _pendingGameSyncs[gameId] = tail;
+    await previous;
+    try {
+      return await body();
+    } finally {
+      finished.complete();
+      if (identical(_pendingGameSyncs[gameId], tail)) {
+        _pendingGameSyncs.remove(gameId);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -365,27 +523,30 @@ class SaveSyncService {
   /// (issue #79).
   Future<bool> pushSaves(Game game, String romPath,
       {DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
+    final slot = saveSlot;
     debugPrint('[SaveSync] ─── PUSH START ─── game="${game.displayName}" slug=${game.platformSlug}');
     debugPrint('[SaveSync]   romPath: $romPath');
     debugPrint('[SaveSync]   syncMode=$syncMode  force=$force  coreOverride=$coreOverride  emulatorId=$emulatorId  sessionStart=$sessionStart');
     await _throwIfSyncBlocked(game, romPath, emulatorId: emulatorId);
-    final caps = await _rommService.fetchCapabilities();
-    final useDevice = caps.hasDeviceSaveSync;
-    debugPrint('[SaveSync]   RomM version: ${useDevice ? "4.9+ (device sync)" : "legacy (<4.9)"}');
-    if (useDevice) {
-      return _devicePushSaves(game, romPath,
-          sessionStart: sessionStart, syncMode: syncMode, force: force, coreOverride: coreOverride, emulatorId: emulatorId);
-    }
-    return _legacyPushSaves(game, romPath,
-        sessionStart: sessionStart, syncMode: syncMode, force: force, coreOverride: coreOverride, emulatorId: emulatorId);
+    return _runGameSync(game.id, () async {
+      final caps = await _rommService.fetchCapabilities();
+      final useDevice = caps.hasDeviceSaveSync;
+      debugPrint('[SaveSync]   RomM version: ${useDevice ? "4.9+ (device sync)" : "legacy (<4.9)"}');
+      if (useDevice) {
+        return _devicePushSaves(game, romPath,
+            slot: slot, sessionStart: sessionStart, syncMode: syncMode, force: force, coreOverride: coreOverride, emulatorId: emulatorId);
+      }
+      return _legacyPushSaves(game, romPath,
+          slot: slot, sessionStart: sessionStart, syncMode: syncMode, force: force, coreOverride: coreOverride, emulatorId: emulatorId);
+    });
   }
 
-  /// In-memory cache of the last pull-check timestamp per game.
+  /// In-memory cache of the last pull-check timestamp and slot per game.
   /// Prevents hitting RomM on every rapid re-launch. Without this,
   /// each game launch makes 2 HTTP requests (list saves + download)
   /// which adds 5-15s of latency. The cooldown means re-launching the
-  /// same game within 60s skips the network check entirely.
-  final Map<String, DateTime> _lastPullCheck = {};
+  /// same game in the same slot within 60s skips the network check entirely.
+  final Map<String, ({String slot, DateTime time})> _lastPullCheck = {};
   static const _pullCheckCooldown = Duration(seconds: 60);
 
   /// Downloads and restores a save for [game] from RomM.
@@ -395,24 +556,29 @@ class SaveSyncService {
   /// This is called before emulator launch — the save is usually already on
   /// disk from the last session, so the pull is non-blocking (fire-and-forget).
   Future<bool> pullSave(Game game, String romPath, {Map<String, dynamic>? saveData, String? coreOverride, String? emulatorId}) async {
-    final now = DateTime.now();
-    final lastCheck = _lastPullCheck[game.id];
-    if (saveData == null && lastCheck != null && now.difference(lastCheck) < _pullCheckCooldown) {
-      debugPrint('[SaveSync] ─── PULL SKIP ─── "${game.displayName}" checked ${now.difference(lastCheck).inSeconds}s ago (cooldown)');
-      return false;
-    }
-    _lastPullCheck[game.id] = now;
-
-    debugPrint('[SaveSync] ─── PULL START ─── game="${game.displayName}" slug=${game.platformSlug}');
-    debugPrint('[SaveSync]   romPath: $romPath  coreOverride=$coreOverride  emulatorId=$emulatorId  saveData=${saveData != null ? "manual" : "auto"}');
+    final slot = saveSlot;
     await _throwIfSyncBlocked(game, romPath, emulatorId: emulatorId);
-    final caps = await _rommService.fetchCapabilities();
-    final useDevice = caps.hasDeviceSaveSync;
-    debugPrint('[SaveSync]   RomM version: ${useDevice ? "4.9+ (device sync)" : "legacy (<4.9)"}');
-    if (useDevice) {
-      return _devicePullSave(game, romPath, saveData: saveData, coreOverride: coreOverride, emulatorId: emulatorId);
-    }
-    return _legacyPullSave(game, romPath, saveData: saveData, coreOverride: coreOverride, emulatorId: emulatorId);
+    return _runGameSync(game.id, () async {
+      // A launch may time out while this pull is queued behind an upload.
+      if (SaveRestoreGuard.restoreTooLate) return false;
+      final now = DateTime.now();
+      final lastCheck = _lastPullCheck[game.id];
+      if (saveData == null && lastCheck != null && lastCheck.slot == slot && now.difference(lastCheck.time) < _pullCheckCooldown) {
+        debugPrint('[SaveSync] ─── PULL SKIP ─── "${game.displayName}" checked ${now.difference(lastCheck.time).inSeconds}s ago (cooldown)');
+        return false;
+      }
+      _lastPullCheck[game.id] = (slot: slot, time: now);
+
+      debugPrint('[SaveSync] ─── PULL START ─── game="${game.displayName}" slug=${game.platformSlug}');
+      debugPrint('[SaveSync]   romPath: $romPath  coreOverride=$coreOverride  emulatorId=$emulatorId  saveData=${saveData != null ? "manual" : "auto"}');
+      final caps = await _rommService.fetchCapabilities();
+      final useDevice = caps.hasDeviceSaveSync;
+      debugPrint('[SaveSync]   RomM version: ${useDevice ? "4.9+ (device sync)" : "legacy (<4.9)"}');
+      if (useDevice) {
+        return _devicePullSave(game, romPath, slot: slot, saveData: saveData, coreOverride: coreOverride, emulatorId: emulatorId);
+      }
+      return _legacyPullSave(game, romPath, slot: slot, saveData: saveData, coreOverride: coreOverride, emulatorId: emulatorId);
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -507,7 +673,7 @@ class SaveSyncService {
   // ---------------------------------------------------------------------------
 
   Future<bool> _devicePushSaves(Game game, String romPath,
-      {DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
+      {required String slot, DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
     try {
       final strategy = getStrategyForGame(game, emulatorId: emulatorId);
       if (strategy == null) {
@@ -516,6 +682,7 @@ class SaveSyncService {
       }
       debugPrint('[SaveSync] [push] Strategy: ${strategy.strategyId}  game="${game.displayName}"');
       _applyStrategyMappings(strategy, game, coreOverride: coreOverride);
+      final keyBeforeCapture = await _localSlotKey(game, strategy, romPath);
 
       var filesMap = await strategy.getSaveFilesWithScreenshots(
         game, romPath,
@@ -541,6 +708,8 @@ class SaveSyncService {
         debugPrint('[SaveSync] [push] All files filtered out — nothing to upload');
         return false;
       }
+      final keyAfterCapture = await _localSlotKey(game, strategy, romPath);
+      final sourceKey = keyBeforeCapture == keyAfterCapture ? keyAfterCapture : null;
 
       final displayStem =
           game.displayName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
@@ -636,7 +805,7 @@ class SaveSyncService {
       }
 
       final String localHash = await _hashFile(finalUploadFile);
-      final String? storedHash = _getStoredHash(game.id, uploadFilename);
+      final String? storedHash = _getStoredHash(game.id, uploadFilename, slot);
 
       if (!force && storedHash != null && localHash == storedHash) {
         debugPrint('[SaveSync] [push] Hash unchanged — skipping upload (already synced)');
@@ -646,13 +815,21 @@ class SaveSyncService {
         return true;
       }
 
+      if (!force) {
+        try {
+          await _throwIfSlotLineageConflict(game, strategy, sourceKey, slot, filesMap.keys);
+        } catch (_) {
+          if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
+          rethrow;
+        }
+      }
       final deviceId = _getDeviceId();
       final result = await _rommService.uploadSave(
         game.id,
         finalUploadFile,
         emulator: _saveEmulatorTag(strategy, game, emulatorId),
         deviceId: deviceId,
-        slot: 'freegosy',
+        slot: slot,
         autocleanup: true,
         autocleanupLimit: 5,
         overwrite: force,
@@ -681,7 +858,8 @@ class SaveSyncService {
       }
 
       if (result.ok) {
-        await _storeHash(game.id, uploadFilename, localHash);
+        await _storeHash(game.id, uploadFilename, localHash, slot);
+        await _recordLocalUpload(game, strategy, sourceKey, slot);
         debugPrint('[SaveSync] [push] Upload OK — $uploadFilename ($fileLen bytes) saved to RomM');
       } else {
         debugPrint('[SaveSync] [push] Upload FAILED — server returned ok=false');
@@ -701,7 +879,7 @@ class SaveSyncService {
   }
 
   Future<bool> _devicePullSave(Game game, String romPath,
-      {Map<String, dynamic>? saveData, String? coreOverride, String? emulatorId}) async {
+      {required String slot, Map<String, dynamic>? saveData, String? coreOverride, String? emulatorId}) async {
     try {
       final strategy = getStrategyForGame(game, emulatorId: emulatorId);
       if (strategy == null) {
@@ -714,7 +892,7 @@ class SaveSyncService {
       final deviceId = _getDeviceId();
       debugPrint('[SaveSync] [pull] Fetching latest save from server (deviceId=${deviceId ?? "none"})...');
       final Map<String, dynamic>? save =
-          saveData ?? await _rommService.getLatestSave(game.id, deviceId: deviceId);
+          saveData ?? await _rommService.getLatestSave(game.id, deviceId: deviceId, slot: slot);
       if (save == null) {
         debugPrint('[SaveSync] [pull] No save found on server — nothing to pull');
         return false;
@@ -727,7 +905,8 @@ class SaveSyncService {
           (d) => d['device_id'] == deviceId,
           orElse: () => null,
         );
-        if (mySync != null && mySync['is_current'] == true) {
+        if (mySync != null && mySync['is_current'] == true &&
+            await _localSlotMatches(game, strategy, romPath, save, slot)) {
           debugPrint('[SaveSync] [pull] Already current on this device — skipping');
           return false;
         }
@@ -776,6 +955,7 @@ class SaveSyncService {
           if (localFilesMap.isNotEmpty) {
             final localContentHash = await _hashSaveContent(localFilesMap);
             if (localContentHash == cloudContentHash) {
+              await _recordLocalSlot(game, strategy, romPath, save['slot']?.toString());
               debugPrint('[SaveSync] [pull] Local save content already matches cloud — skipping restore');
               return false;
             }
@@ -787,12 +967,17 @@ class SaveSyncService {
         debugPrint('[SaveSync] [pull] The launch went ahead without this pull — not restoring "$adjustedFilename"');
         return false;
       }
+      // A failed/partial restore must not leave the old lineage trusted.
+      // An object value cannot match a slot string (including a null slot).
+      await _writeLocalSlot(game, strategy, romPath, '{}', invalidate: true);
+      if (SaveRestoreGuard.restoreTooLate) return false;
       final ok = await strategy.restoreSave(game, romPath, bytes, adjustedFilename);
       if (!ok) {
         debugPrint('[SaveSync] [pull] Strategy failed to restore save');
         throw Exception(
             'Strategy [${strategy.strategyId}] failed to restore save: $filename');
       }
+      await _recordLocalSlot(game, strategy, romPath, save['slot']?.toString());
       debugPrint('[SaveSync] ─── PULL END ─── restored OK');
       return ok;
     } on io.FileSystemException catch (e) {
@@ -812,7 +997,7 @@ class SaveSyncService {
   /// Legacy upload path for RomM versions prior to 4.9.
   /// Uses timestamp-based conflict detection and manual save pruning.
   Future<bool> _legacyPushSaves(Game game, String romPath,
-      {DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
+      {required String slot, DateTime? sessionStart, String syncMode = 'both', bool force = false, String? coreOverride, String? emulatorId}) async {
     try {
       final strategy = getStrategyForGame(game, emulatorId: emulatorId);
       if (strategy == null) {
@@ -822,7 +1007,7 @@ class SaveSyncService {
       debugPrint('[SaveSync] [push] Strategy: ${strategy.strategyId}  (legacy path)');
 
       _applyStrategyMappings(strategy, game, coreOverride: coreOverride);
-
+      final keyBeforeCapture = await _localSlotKey(game, strategy, romPath);
       var filesMap = await strategy.getSaveFilesWithScreenshots(
         game, romPath,
         sessionStart: sessionStart,
@@ -864,14 +1049,16 @@ class SaveSyncService {
         filesMap = filteredMap;
       }
       if (filesMap.isEmpty) return false;
+      final keyAfterCapture = await _localSlotKey(game, strategy, romPath);
+      final sourceKey = keyBeforeCapture == keyAfterCapture ? keyAfterCapture : null;
 
       // --- Conflict Detection ---
       if (!force) {
         debugPrint('[SaveSync] [push] Checking for conflicts...');
-        final latestRemote = await _rommService.getLatestSave(game.id);
+        final latestRemote = await _rommService.getLatestSave(game.id, slot: slot);
         if (latestRemote != null) {
           final remoteTime = DateTime.tryParse(latestRemote['updated_at']?.toString() ?? '');
-          final lastPull = _getLastPullTime(game.id);
+          final lastPull = _getLastPullTime(game.id, slot);
           
           // If remote is newer than our last pull, and we have local changes -> Conflict!
           if (remoteTime != null && lastPull != null && remoteTime.isAfter(lastPull)) {
@@ -958,7 +1145,7 @@ class SaveSyncService {
       }
 
       final String localHash = await _hashFile(finalUploadFile);
-      final String? storedHash = _getStoredHash(game.id, uploadFilename);
+      final String? storedHash = _getStoredHash(game.id, uploadFilename, slot);
 
       if (!force && storedHash != null && localHash == storedHash) {
         debugPrint('[SaveSync] [push] Hash unchanged — skipping upload');
@@ -971,11 +1158,20 @@ class SaveSyncService {
       // overwrite=force: Manual "Push" updates the existing record in place.
       // This replaces the old approach of client-side pruneOldSaves() which
       // made extra API calls. Server-side autocleanup is more efficient.
+      if (!force) {
+        try {
+          await _throwIfSlotLineageConflict(game, strategy, sourceKey, slot, filesMap.keys);
+        } catch (_) {
+          if (isBundle && await finalUploadFile.exists()) await finalUploadFile.delete();
+          rethrow;
+        }
+      }
       final result = await _rommService.uploadSave(
         game.id,
         finalUploadFile,
         emulator: _saveEmulatorTag(strategy, game, emulatorId),
         screenshotFile: finalScreenshotFile,
+        slot: slot,
         overrideFilename: uploadFilename,
         autocleanup: true,
         autocleanupLimit: 5,
@@ -984,7 +1180,8 @@ class SaveSyncService {
 
       if (result.ok) {
         uploaded++;
-        await _storeHash(game.id, uploadFilename, localHash);
+        await _storeHash(game.id, uploadFilename, localHash, slot);
+        await _recordLocalUpload(game, strategy, sourceKey, slot);
         debugPrint('[SaveSync] [push] Upload OK — $uploadFilename ($fileLen bytes) saved to RomM');
       } else {
         debugPrint('[SaveSync] [push] Upload FAILED');
@@ -1055,7 +1252,7 @@ class SaveSyncService {
 
   /// Legacy pull path for RomM versions prior to 4.9.
   /// Uses stored last-pull timestamps for freshness checks.
-  Future<bool> _legacyPullSave(Game game, String romPath, {Map<String, dynamic>? saveData, String? coreOverride, String? emulatorId}) async {
+  Future<bool> _legacyPullSave(Game game, String romPath, {required String slot, Map<String, dynamic>? saveData, String? coreOverride, String? emulatorId}) async {
     try {
       final strategy = getStrategyForGame(game, emulatorId: emulatorId);
       if (strategy == null) {
@@ -1067,7 +1264,7 @@ class SaveSyncService {
       _applyStrategyMappings(strategy, game, coreOverride: coreOverride);
 
       debugPrint('[SaveSync] [pull] Fetching latest save from server...');
-      final Map<String, dynamic>? save = saveData ?? await _rommService.getLatestSave(game.id);
+      final Map<String, dynamic>? save = saveData ?? await _rommService.getLatestSave(game.id, slot: slot);
       if (save == null) {
         debugPrint('[SaveSync] [pull] No save found on server');
         return false;
@@ -1076,11 +1273,12 @@ class SaveSyncService {
       if (saveData == null) {
         final remoteUpdatedAt = DateTime.tryParse(
             save['updated_at']?.toString() ?? '');
-        final lastPull = _getLastPullTime(game.id);
+        final lastPull = _getLastPullTime(game.id, slot);
 
         if (lastPull != null &&
             remoteUpdatedAt != null &&
-            !remoteUpdatedAt.isAfter(lastPull)) {
+            !remoteUpdatedAt.isAfter(lastPull) &&
+            await _localSlotMatches(game, strategy, romPath, save, slot)) {
           debugPrint('[SaveSync] [pull] Save not newer than last pull — skipping');
           return false;
         }
@@ -1121,10 +1319,13 @@ class SaveSyncService {
         debugPrint('[SaveSync] [pull] The launch went ahead without this pull — not restoring "$adjustedFilename"');
         return false;
       }
+      await _writeLocalSlot(game, strategy, romPath, '{}', invalidate: true);
+      if (SaveRestoreGuard.restoreTooLate) return false;
       final ok = await strategy.restoreSave(game, romPath, bytes, adjustedFilename);
 
       if (ok) {
-        await _setLastPullTime(game.id);
+        await _setLastPullTime(game.id, slot);
+        await _recordLocalSlot(game, strategy, romPath, save['slot']?.toString());
         debugPrint('[SaveSync] ─── PULL END ─── restored OK');
       } else {
         debugPrint('[SaveSync] [pull] Strategy failed to restore save');

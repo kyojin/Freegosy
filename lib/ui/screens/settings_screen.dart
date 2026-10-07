@@ -39,6 +39,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   late TextEditingController _usernameController;
   late TextEditingController _passwordController;
   late TextEditingController _apiKeyController;
+  late TextEditingController _rommSaveSlotController;
+  String? _rommSaveSlotError;
   bool _preferencesLoaded = false;
   bool _isLegacyAuth = false;
   bool _trustSelfSigned = false;
@@ -54,6 +56,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _usernameController = TextEditingController();
     _passwordController = TextEditingController();
     _apiKeyController = TextEditingController();
+    _rommSaveSlotController = TextEditingController();
     // Refresh emulator status when settings screen is opened
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.invalidate(emulatorStatusProvider);
@@ -66,6 +69,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _usernameController.dispose();
     _passwordController.dispose();
     _apiKeyController.dispose();
+    _rommSaveSlotController.dispose();
     super.dispose();
   }
 
@@ -474,6 +478,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             _usernameController.text = rommConfig.username;
             _passwordController.text = rommConfig.password;
             _apiKeyController.text = rommConfig.apiKey;
+            _rommSaveSlotController.text = RomMConfig.normalizeSaveSlot(
+                ref.read(appPreferencesProvider).getString(RomMConfig.saveSlotPreferenceKey) ??
+                    rommConfig.saveSlot);
             _isLegacyAuth = rommConfig.apiKey.isEmpty && 
                            (rommConfig.username.isNotEmpty || rommConfig.password.isNotEmpty);
             _trustSelfSigned = rommConfig.trustSelfSigned;
@@ -729,6 +736,50 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             subtitle: 'Let RomM show this device as "currently playing" while a game is running',
             value: activeSessionSyncEnabled,
             onChanged: (val) => ref.read(rommActiveSessionSyncProvider.notifier).update(val),
+          ),
+          const SizedBox(height: 16),
+          Text('Save Sync', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: theme.colorScheme.primary)),
+          const SizedBox(height: 12),
+          TextField(
+            key: const ValueKey('rommSaveSlot'),
+            controller: _rommSaveSlotController,
+            decoration: _buildInputDecoration(context, 'RomM save slot').copyWith(
+              hintText: RomMConfig.defaultSaveSlot,
+              errorText: _rommSaveSlotError,
+            ),
+            onChanged: (_) {
+              if (_rommSaveSlotError != null) setState(() => _rommSaveSlotError = null);
+            },
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Use autosave to share saves with Argosy, or enter a custom slot. '
+            'Default: ${RomMConfig.defaultSaveSlot}. Existing cloud saves stay in their slots.',
+            style: TextStyle(fontSize: 12, color: theme.colorScheme.onSurfaceVariant),
+          ),
+          const SizedBox(height: 12),
+          _buildActionButton(
+            context,
+            icon: Icons.save,
+            label: 'Save slot',
+            onTap: () async {
+              final slot = RomMConfig.normalizeSaveSlot(_rommSaveSlotController.text);
+              final error = RomMConfig.validateSaveSlot(slot);
+              if (error != null) {
+                setState(() => _rommSaveSlotError = error);
+                return;
+              }
+              try {
+                final prefs = ref.read(appPreferencesProvider);
+                final saved = await prefs.setString(RomMConfig.saveSlotPreferenceKey, slot);
+                if (!saved) throw StateError('Could not persist the RomM save slot.');
+                if (!mounted) return;
+                _rommSaveSlotController.text = slot;
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('RomM save slot saved.')));
+              } catch (e) {
+                if (mounted) ErrorHandler.showException(context, e, contextLabel: 'Saving RomM save slot');
+              }
+            },
           ),
           const SizedBox(height: 16),
           if (_connectionAppError != null)

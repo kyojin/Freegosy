@@ -27,6 +27,9 @@ void main() {
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     mockRommService = MockRommService();
+    when(mockRommService.config).thenReturn(
+      RomMConfig(baseUrl: 'https://romm.example.com', username: '', password: ''),
+    );
     mockDirectoryService = MockDirectoryService();
     mockStrategyRegistry = MockStrategyRegistry();
     
@@ -44,7 +47,7 @@ void main() {
         .thenAnswer((_) async => sysTemp);
     
     final prefs = SharedPreferencesAppPreferences(await SharedPreferences.getInstance());
-    when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'))).thenAnswer((_) async => null);
+    when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess'))).thenAnswer((_) async => null);
     // Default to legacy mode so existing tests are unaffected
     when(mockRommService.fetchCapabilities())
         .thenAnswer((_) async => RommCapabilities.unknown());
@@ -140,7 +143,7 @@ void main() {
       clearInteractions(mockRommService);
       // We must re-stub because clearInteractions might affect stubs depending on implementation, 
       // though usually it only clears call history. But to be safe:
-      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'))).thenAnswer((_) async => null);
+      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess'))).thenAnswer((_) async => null);
 
       final ok = await service.pushSaves(game, romPath);
       expect(ok, isTrue, reason: 'Should return true (success) even if skipping due to matching hash');
@@ -205,7 +208,7 @@ void main() {
 
         final game = Game(id: 'g2', name: 'game', platformSlug: 'gba', fileSize: 0);
 
-        when(mockRommService.getLatestSave('g2', deviceId: anyNamed('deviceId')))
+        when(mockRommService.getLatestSave('g2', deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
             .thenAnswer((_) async => null);
         when(mockRommService.uploadSave(
           any, any,
@@ -354,7 +357,7 @@ void main() {
       
       // Mock remote to be NEWER than last pull (30 mins ago)
       final remoteTime = DateTime.now().subtract(const Duration(minutes: 30));
-      when(mockRommService.getLatestSave('game1', deviceId: anyNamed('deviceId'))).thenAnswer((_) async => {
+      when(mockRommService.getLatestSave('game1', deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess'))).thenAnswer((_) async => {
         'updated_at': remoteTime.toIso8601String(),
         'screenshot_url': 'http://remote-screenshot.png',
       });
@@ -484,7 +487,7 @@ void main() {
       await service.pushSaves(pcsx2Game(), romPath);
       expect(uploadedBytes, isNotNull);
 
-      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId')))
+      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
           .thenAnswer((_) async => {
                 'download_path': 'https://example.test/save.zip',
                 'file_name': 'Ico (SLUS-12345).zip',
@@ -514,7 +517,7 @@ void main() {
       archive.addFile(ArchiveFile.string('SLUS-12345/save.bin', 'CLOUD_NEW'));
       final cloudZipBytes = Uint8List.fromList(ZipEncoder().encode(archive));
 
-      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId')))
+      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
           .thenAnswer((_) async => {
                 'download_path': 'https://example.test/save.zip',
                 'file_name': 'Ico (SLUS-12345).zip',
@@ -541,7 +544,7 @@ void main() {
       final cloudZipBytes = Uint8List.fromList(ZipEncoder().encode(archive));
 
       final guard = SaveRestoreGuard();
-      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId')))
+      when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
           .thenAnswer((_) async => {
                 'download_path': 'https://example.test/save.zip',
                 'file_name': 'Ico (SLUS-12345).zip',

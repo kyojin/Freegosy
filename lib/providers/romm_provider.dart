@@ -82,6 +82,7 @@ final rommConfigProvider = FutureProvider<RomMConfig>((ref) async {
     token: token, 
     apiKey: apiKey,
     trustSelfSigned: trustSelfSigned,
+    saveSlot: prefs.getString(RomMConfig.saveSlotPreferenceKey),
   );
 });
 
@@ -230,7 +231,7 @@ final rommServiceProvider = Provider<RommService?>((ref) {
   if (config != null && directoryService != null && config.baseUrl.isNotEmpty) {
     try {
       debugPrint('[RomM-Init] Initializing RommService with config for ${config.baseUrl}');
-      final service = RommService(config);
+      final service = RommService(config, prefs: ref.read(appPreferencesProvider));
       // Refresh token on startup to ensure latest scopes
       if (config.username.isNotEmpty && config.password.isNotEmpty) {
         debugPrint('[RomM-Init] Triggering background token refresh...');

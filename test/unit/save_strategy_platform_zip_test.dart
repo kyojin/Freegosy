@@ -24,6 +24,9 @@ void main() {
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     mockRommService = MockRommService();
+    when(mockRommService.config).thenReturn(
+      RomMConfig(baseUrl: 'https://romm.example.com', username: '', password: ''),
+    );
     mockDirectoryService = MockDirectoryService();
     mockStrategyRegistry = MockStrategyRegistry();
     
@@ -40,7 +43,7 @@ void main() {
         .thenAnswer((_) async => sysTemp);
     
     final prefs = SharedPreferencesAppPreferences(await SharedPreferences.getInstance());
-    when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'))).thenAnswer((_) async => null);
+    when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess'))).thenAnswer((_) async => null);
     when(mockRommService.fetchCapabilities()).thenAnswer((_) async => RommCapabilities.unknown());
     service = SaveSyncService(mockRommService, mockDirectoryService, mockStrategyRegistry, prefs);
 
@@ -282,7 +285,7 @@ void main() {
         'updated_at': DateTime.now().toIso8601String(),
       };
 
-      when(mockRommService.getLatestSave('game1'))
+      when(mockRommService.getLatestSave('game1', slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
           .thenAnswer((_) async => saveEntry);
       when(mockRommService.downloadSave(any))
           .thenAnswer((_) async => zipBytes);
@@ -326,7 +329,7 @@ void main() {
         'updated_at': DateTime.now().toIso8601String(),
       };
 
-      when(mockRommService.getLatestSave('game2'))
+      when(mockRommService.getLatestSave('game2', slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
           .thenAnswer((_) async => saveEntry);
       when(mockRommService.downloadSave(any))
           .thenAnswer((_) async => rawBytes);

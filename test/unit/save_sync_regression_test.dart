@@ -24,6 +24,9 @@ void main() {
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     mockRommService = MockRommService();
+    when(mockRommService.config).thenReturn(
+      RomMConfig(baseUrl: 'https://romm.example.com', username: '', password: ''),
+    );
     mockDirectoryService = MockDirectoryService();
     mockStrategyRegistry = MockStrategyRegistry();
 
@@ -37,7 +40,7 @@ void main() {
         .thenAnswer((_) async => Directory.systemTemp.path);
 
     final prefs = SharedPreferencesAppPreferences(await SharedPreferences.getInstance());
-    when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId')))
+    when(mockRommService.getLatestSave(any, deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
         .thenAnswer((_) async => null);
     when(mockRommService.fetchCapabilities())
         .thenAnswer((_) async => RommCapabilities.unknown());
@@ -113,13 +116,12 @@ void main() {
 
       await service.pushSaves(game, romPath);
 
-      // Verify uploadSave was called — the slot defaults to 'freegosy'
-      // inside romm_service.dart when null is passed
+      // The legacy path passes the configured default explicitly too.
       verify(mockRommService.uploadSave(
         'slot1',
         any,
         emulator: anyNamed('emulator'),
-        slot: anyNamed('slot'),
+        slot: 'freegosy',
         deviceId: anyNamed('deviceId'),
         autocleanup: anyNamed('autocleanup'),
         autocleanupLimit: anyNamed('autocleanupLimit'),
@@ -256,7 +258,7 @@ void main() {
           id: 'cd1', name: 'game', platformSlug: 'gba', fileSize: 0);
 
       // First pull — should hit network
-      when(mockRommService.getLatestSave('cd1', deviceId: anyNamed('deviceId')))
+      when(mockRommService.getLatestSave('cd1', deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
           .thenAnswer((_) async => null);
 
       await service.pullSave(game, romPath);
@@ -265,7 +267,7 @@ void main() {
 
       // getLatestSave should only be called once (first pull)
       // Second pull is skipped due to cooldown
-      verify(mockRommService.getLatestSave('cd1', deviceId: anyNamed('deviceId')))
+      verify(mockRommService.getLatestSave('cd1', deviceId: anyNamed('deviceId'), slot: anyNamed('slot'), requireSuccess: anyNamed('requireSuccess')))
           .called(1);
 
       await tempDir.delete(recursive: true);

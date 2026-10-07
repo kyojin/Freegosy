@@ -24,5 +24,6 @@ Future<RomMConfig> loadCliRommConfig(AppPreferences prefs) async {
     token: token,
     apiKey: apiKey,
     trustSelfSigned: trustSelfSigned,
+    saveSlot: prefs.getString(RomMConfig.saveSlotPreferenceKey),
   );
 }

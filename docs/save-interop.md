@@ -25,13 +25,45 @@ For reference when reading the matrices:
   under its own name; several go up as one zip. Game saves are tagged on RomM
   with the emulator that made them: the RetroArch core without `_libretro`
   (e.g. `pcsx_rearmed`, as RomM's web player and Argosy name it), otherwise the
-  emulator (e.g. `pcsx2`, `duckstation`), in the `freegosy` slot.
-- **Download**: Freegosy takes RomM's **newest save for the game, whoever
-  uploaded it** (`RommService.getLatestSave`; neither the tag nor the slot is
-  checked), and hands it to the strategy of the emulator on this
-  machine (`restoreSave`), which decides where, and under what name, it goes.
+  emulator (e.g. `pcsx2`, `duckstation`), in the configured RomM save slot
+  (`freegosy` by default).
+- **Download**: Freegosy prefers RomM's **newest save in the configured slot**,
+  by update time, whoever uploaded it (`RommService.getLatestSave`). If that
+  slot has no saves, it falls back to the newest save across all slots. It hands the save to the
+  strategy of the emulator on this machine (`restoreSave`), which decides
+  where, and under what name, it goes.
 - So for a save to cross emulators, the **receiving** strategy must recognise
   the uploaded file (name and format) and write it where its emulator reads it.
+
+To share a save lineage with Argosy, open **Settings → RomM Server → Save
+Sync**, set **RomM save slot** to `autosave`, and click **Save slot**. Custom
+slot names can contain up to 255 Unicode code points; surrounding whitespace
+is removed and a blank value resets to `freegosy`. The setting persists across
+restarts and applies to both GUI and headless CLI sync, including queued
+offline uploads. Changing it does not move or delete existing saves. Normal
+upload retention still applies within
+the selected slot. The manual save picker continues to list every slot.
+
+Each sync operation uses the slot selected when it starts, even if the setting
+changes during a transfer. Subsequent operations, including a running game's
+post-exit upload and queued backups, read the updated setting. Saving the slot
+does not reconnect to RomM or trigger queued uploads. Sync operations for the
+same game run serially, including across retained service instances; different
+games remain independent. Freegosy records which slot was last restored or
+pushed for the game's resolved save directory, so returning to a previous slot
+restores its save even if that device synced it
+earlier. Existing sync history for the default slot is kept.
+
+When a strategy discovers its directory during archive restoration, Freegosy
+tracks that lineage for the game and emulator until the directory can be
+resolved. A restore invalidates the previous marker before changing files, so
+a failed or partial restore cannot leave the previous lineage marked current.
+
+An automatic push into an occupied slot requires the local save to belong to
+that lineage. If its pull failed or the local save still belongs to another
+slot, the existing conflict dialog lets you keep local progress or restore the
+cloud save. Explicit forced pushes keep their existing behavior. Failed or
+malformed save-list queries cannot be treated as proof that a slot is empty.
 
 ## PlayStation (PS1)
 

@@ -305,6 +305,9 @@ void main() {
       SharedPreferences.setMockInitialValues({});
       final prefs = SharedPreferencesAppPreferences(await SharedPreferences.getInstance());
       final romm = MockRommService();
+      when(romm.config).thenReturn(
+        RomMConfig(baseUrl: 'https://romm.example.com', username: '', password: ''),
+      );
       final sync = SaveSyncService(romm, env.directoryService, StrategyRegistry(env.directoryService, prefs), prefs);
 
       await expectLater(sync.pushSaves(game, romPath(), emulatorId: 'duckstation'),
