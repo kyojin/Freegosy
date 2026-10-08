@@ -341,10 +341,16 @@ class GameLaunchService {
     String? backupZipPath;
     await SaveOperationLock.run(game.id, (lease) async {
       final cutoff = DateTime.now();
-      final pendingAtStart = backupRepository
-          .getEntries(game.id)
-          .where((entry) => !entry.isSynced && !entry.timestamp.isAfter(cutoff))
-          .toList();
+      var pendingAtStart = <BackupEntry>[];
+      try {
+        pendingAtStart = backupRepository
+            .getEntries(game.id)
+            .where((entry) => !entry.isSynced && !entry.timestamp.isAfter(cutoff))
+            .toList();
+      } catch (e) {
+        // Retry bookkeeping must not prevent the normal save push.
+        dev.log('Could not read pending backups (non-fatal)', error: e);
+      }
       var retryNeeded = false;
       try {
         final pushResult = await saveSyncService.pushSavesWithResult(
@@ -358,10 +364,17 @@ class GameLaunchService {
         );
         syncOk = pushResult == SavePushResult.synced;
         retryNeeded = pushResult == SavePushResult.failed;
-        if (syncOk)
-          await backupRepository.acknowledgeEntries(game.id, pendingAtStart);
       } on SaveSyncNotPossibleException catch (e) {
         saveSyncBlocked = e.message;
+      }
+
+      if (syncOk && pendingAtStart.isNotEmpty) {
+        try {
+          await backupRepository.acknowledgeEntries(game.id, pendingAtStart);
+        } catch (e) {
+          // The save is already synced; continue the remaining post-exit work.
+          dev.log('Could not acknowledge pending backups (non-fatal)', error: e);
+        }
       }
 
       // Save states sync separately from game saves; see [pushStatesAfterExit].

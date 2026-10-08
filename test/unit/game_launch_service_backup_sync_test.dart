@@ -1,15 +1,84 @@
 import 'dart:io' as io;
 import 'package:archive/archive.dart';
+import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:freegosy/core/emulator/game_launch_service.dart';
 import 'package:freegosy/core/romm/romm_models.dart';
+import 'package:freegosy/core/romm/romm_service.dart';
 import 'package:freegosy/core/save/backup_entry.dart';
 import 'package:freegosy/core/save/backup_repository.dart';
+import 'package:freegosy/core/save/backup_service.dart';
 import 'package:freegosy/core/save/save_strategy.dart';
 import 'package:freegosy/core/save/save_sync_service.dart';
+import 'package:freegosy/core/save/state_sync_service.dart';
+import 'package:freegosy/core/storage/app_preferences.dart';
 import 'package:hive/hive.dart';
 import 'package:path/path.dart' as p;
 import '../helpers/game_launch_service_fakes.dart';
+import '../helpers/fake_romm_states_api.dart';
+
+class _FaultyBackupRepository extends BackupRepository {
+  bool failNextRead = false;
+  bool failAllReads = false;
+  bool failAcknowledgement = false;
+
+  @override
+  List<BackupEntry> getEntries(String romId) {
+    if (failNextRead || failAllReads) {
+      failNextRead = false;
+      throw const io.FileSystemException('Backup database read failed');
+    }
+    return super.getEntries(romId);
+  }
+
+  @override
+  Future<void> acknowledgeEntries(String romId, List<BackupEntry> covered) {
+    if (failAcknowledgement) {
+      return Future.error(
+        const io.FileSystemException('Backup database write failed'),
+      );
+    }
+    return super.acknowledgeEntries(romId, covered);
+  }
+}
+
+class _RecordingBackupService extends FixedBackupService {
+  _RecordingBackupService(super.zipPath, this.log);
+  final List<String> log;
+
+  @override
+  Future<BackupResult?> createImmediate(
+    Game game,
+    String romPath,
+    SaveSyncService syncService, {
+    String? emulatorId,
+  }) {
+    log.add('backup');
+    return super.createImmediate(
+      game,
+      romPath,
+      syncService,
+      emulatorId: emulatorId,
+    );
+  }
+}
+
+class _RecordingStateSync extends StateSyncService {
+  _RecordingStateSync(AppPreferences prefs, this.log)
+    : super(FakeRommStatesApi(), prefs, (game, {emulatorId}) => null);
+  final List<String> log;
+
+  @override
+  Future<StateSyncResult> pushStates(
+    Game game,
+    String romPath, {
+    DateTime? sessionStart,
+    String? emulatorId,
+  }) async {
+    log.add('states');
+    return StateSyncResult();
+  }
+}
 
 final _game = Game(
   id: '42',
@@ -54,6 +123,145 @@ void main() {
       await Hive.openBox<List>('freegosy_backups');
       return BackupRepository()..initBox();
     }
+
+    for (final fault in [
+      'snapshot read',
+      'acknowledgement write',
+      'all reads',
+    ]) {
+      for (final pushOk in [true, false]) {
+        // A failed push does not acknowledge anything.
+        if (fault == 'acknowledgement write' && !pushOk) continue;
+        test(
+          '$fault failure preserves push=$pushOk and later post-exit work',
+          () async {
+            final olderZip = await backupZip.copy(
+              p.join(tempDir.path, 'older.zip'),
+            );
+            await repository.addEntry(
+              _game.id,
+              BackupEntry(
+                timestamp: DateTime(2025),
+                md5Hash: 'older',
+                localZipPath: olderZip.path,
+              ),
+            );
+            final faulty = _FaultyBackupRepository()..initBox();
+            faulty.failNextRead = fault == 'snapshot read';
+            faulty.failAllReads = fault == 'all reads';
+            faulty.failAcknowledgement = fault == 'acknowledgement write';
+            final log = <String>[];
+            final base = await launchServiceLogging(log, pushOk: pushOk);
+            await base.prefs.setString('romm_device_id', 'device-1');
+            final dio = Dio();
+            Map<String, dynamic>? playSessionPayload;
+            dio.interceptors.add(
+              InterceptorsWrapper(
+                onRequest: (options, handler) {
+                  if (options.path == '/api/heartbeat') {
+                    handler.resolve(
+                      Response(
+                        requestOptions: options,
+                        statusCode: 200,
+                        data: {
+                          'SYSTEM': {'VERSION': '4.9.0'},
+                        },
+                      ),
+                    );
+                  } else if (options.path == '/api/play-sessions' &&
+                      options.method == 'POST') {
+                    log.add('play session');
+                    playSessionPayload = Map<String, dynamic>.from(
+                      options.data,
+                    );
+                    handler.resolve(
+                      Response(
+                        requestOptions: options,
+                        statusCode: 200,
+                        data: {},
+                      ),
+                    );
+                  } else {
+                    handler.reject(
+                      DioException(
+                        requestOptions: options,
+                        error: 'Unexpected request',
+                      ),
+                    );
+                  }
+                },
+              ),
+            );
+            final romm = RommService(
+              RomMConfig(
+                baseUrl: 'https://romm.example.com',
+                username: '',
+                password: '',
+              ),
+              dio: dio,
+              skipConnectivityCheck: true,
+            );
+            addTearDown(romm.isOffline.dispose);
+            final service = GameLaunchService(
+              directoryService: base.directoryService,
+              strategyRegistry: base.strategyRegistry,
+              saveSyncService: base.saveSyncService,
+              backupService: _RecordingBackupService(backupZip.path, log),
+              backupRepository: faulty,
+              prefs: base.prefs,
+              stateSyncService: _RecordingStateSync(base.prefs, log),
+              rommService: romm,
+            );
+            final result = await service.awaitExitAndSync(
+              exited(),
+              _game,
+              'Ico.iso',
+              syncMode: 'both',
+            );
+            expect(log, ['push', 'states', 'backup', 'play session']);
+            expect(result!.syncOk, pushOk);
+            expect(result.playSessionRecorded, isTrue);
+            expect(playSessionPayload!['device_id'], 'device-1');
+            expect(playSessionPayload!['sessions'].single['rom_id'], 42);
+            expect(
+              result.backupZipPath,
+              fault == 'all reads' ? isNull : backupZip.path,
+            );
+            final reopened = await reopenRepository();
+            expect(reopened.getEntries(_game.id).last.isSynced, isFalse);
+            if (fault != 'all reads') {
+              expect(reopened.getEntries(_game.id).first.isSynced, pushOk);
+            }
+            expect(await olderZip.exists(), isTrue);
+            expect(await backupZip.exists(), isTrue);
+          },
+        );
+      }
+    }
+
+    test(
+      'a retry snapshot read failure does not swallow a save conflict',
+      () async {
+        final faulty = _FaultyBackupRepository()..initBox();
+        faulty.failNextRead = true;
+        final service = await launchServiceLogging(
+          [],
+          conflict: true,
+          backupService: FixedBackupService(backupZip.path),
+          backupRepository: faulty,
+        );
+        await expectLater(
+          service.awaitExitAndSync(
+            exited(),
+            _game,
+            'Ico.iso',
+            syncMode: 'both',
+          ),
+          throwsA(isA<SaveConflictException>()),
+        );
+        expect(repository.getEntries(_game.id), isEmpty);
+      },
+    );
 
     for (final (label, pushOk, blockedReason, queued) in [
       ('successful push', true, null, false),
